@@ -6,6 +6,7 @@ ChIP-Seq peak calling algorithm using [cupy](https://cupy.dev/).
 
 Example usage scripts can be found in `examples`.
 
+More implementation details about the gmacs can be found [here](https://substack.com/inbox/post/155316519)
 ## Installation
 
 `pip install -e .`
