@@ -1,20 +1,29 @@
 from pathlib import Path
 
 import pandas as pd
+import polars as ps
 import zstandard as zstd
 
 dctx = zstd.ZstdDecompressor()
 
 
-def load_bedfile(zst_file: Path):
+def load_bedfile(zst_file):
     with open(zst_file, "rb") as f:
+        dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(f) as reader:
-            df = pd.read_csv(
-                reader, sep="\t", names=["chr", "start", "end", "strand", "qual"]
+            df = ps.read_csv(
+                reader,
+                separator="\t",
+                new_columns=["chr", "start", "end", "strand", "qual"],
             )
     num_reads = len(df)
-    intervals_by_chrom = {
-        key: group[["start", "end"]].to_dict(orient="list")
-        for key, group in df.reset_index().groupby("chr")
+    result_df = df.group_by("chr").agg(
+        [ps.col("start").implode(), ps.col("end").implode()]
+    )
+
+    # Convert to desired dictionary format
+    result = {
+        row["chr"]: {"start": row["start"], "end": row["end"]}
+        for row in result_df.to_dicts()
     }
-    return intervals_by_chrom, num_reads
+    return result, num_reads

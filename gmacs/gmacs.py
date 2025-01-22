@@ -46,7 +46,7 @@ def compute_peaks(q_vals, thresh=0.1):
     outputs:
         - peaks: cupy vector of indices where q-values <= thresh
     """
-    peaks = cp.where(q_vals <= thresh)[0]
+    peaks = cp.where((q_vals >= thresh))[0]
     return peaks
 
 
@@ -60,7 +60,7 @@ def merge_consecutive(arr, max_gap=30):
     outputs:
         - M: a matrix with two columns encoding the start and ends of peaks
     """
-    boundaries = cp.where(cp.diff(arr) > max_gap)[0] + 1
+    boundaries = cp.where(cp.diff(arr) >= max_gap)[0] + 1
     split_indices = cp.concatenate(
         (cp.asarray([0]), boundaries, cp.asarray([len(arr)]))
     )
@@ -99,15 +99,12 @@ def calculate_peak_summits(peaks, signal):
     """
     starts = peaks[:, 0]
     ends = peaks[:, 1]
-    min_values = np.zeros(len(starts))
-    arg_min_indices = np.zeros(len(starts))
+    max_values = np.zeros(len(starts))
+    arg_max_indices = np.zeros(len(starts), dtype=np.int64)
     for i in range(0, len(starts)):
         am = starts[i] + np.argmin(signal[starts[i] : ends[i]])
-        m = signal[am]
-        min_values[i] = m
-        arg_min_indices = am
-
-    return min_values, arg_min_indices
+        arg_max_indices[i] = am
+    return arg_max_indices
 
 
 def extract_values(indexes, vec):
@@ -310,7 +307,7 @@ def call_peaks(
     q_values[q_values == cp.inf] = 1000
     print(dt.datetime.now(), "Computed q Values")
 
-    peaks = compute_peaks(q_values, pileup_treat, pileup_ctrl, q_thresh)
+    peaks = compute_peaks(q_values, q_thresh)
     print(dt.datetime.now(), "Calculated Peaks")
 
     if len(peaks) == 0:
@@ -445,5 +442,8 @@ def gmacs(
 
 
 if __name__ == "__main__":
-    intervals_by_chrom, num_reads = load_bedfile(Path("../MACS-3/Test_Data_2/1_.zst"))
+    intervals_by_chrom, num_reads = load_bedfile(
+        Path("../../MACS-3/Test_Data_2/1_.zst")
+    )
     df_op = gmacs(intervals_by_chrom=intervals_by_chrom, num_reads=num_reads)
+    print(df_op.head())
