@@ -1,10 +1,12 @@
 import datetime as dt
+from collections import defaultdict
 from pathlib import Path
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 from cupyx.scipy.ndimage import maximum_filter1d
-from cupyx.scipy.special import pdtr
+from cupyx.scipy.special import pdtr, pdtrc
 
 from .utils import load_bedfile
 
@@ -12,30 +14,9 @@ mempool = cp.get_default_memory_pool()
 pinned_mempool = cp.get_default_pinned_memory_pool()
 
 
-def compute_q_values(p_values):
-    """Compute the FDR corrected qvalues.
-
-    inputs:
-        - p_values: cupy vector of p-values at every point along the chromosome
-    outputs:
-        - q_values: cupy vector of q-values at every point along the chromosome
-    """
-    n = len(p_values)
-    sorted_indices = cp.argsort(p_values)
-    sorted_p_values = p_values[sorted_indices]
-    ranks = cp.arange(1, n + 1)
-    q_values = (sorted_p_values * n) / ranks
-    q_values = q_values[::-1]
-    q_values = np.minimum.accumulate(cp.asnumpy(q_values))[::-1]
-    q_values = cp.asarray(q_values)
-    original_order_q_values = cp.empty_like(q_values)
-    original_order_q_values[sorted_indices] = q_values
-    del q_values
-    return original_order_q_values
-
-
 def pileup(starts, ends, chr_length, offset):
-    """For each point along the chromosome, compute the number of aligning
+    """
+    For each point along the chromosome, compute the number of aligning
     reads.
 
     Pileup is the total number of reads aligning to the chromosome.
@@ -54,23 +35,6 @@ def pileup(starts, ends, chr_length, offset):
     cov_vec = cp.cumsum(cov_vec)
 
     return cov_vec
-
-
-def compute_poisson_cdfs(observations, lambdas):
-    """
-    Function to compute the upper tail of a Poisson distribution. At every point along the chromsome we estimate
-    the expected number of reads based on a Poisson distribution. The expected number of reads is calculated as
-    max(scale*depth, lambda_bg).
-    lambda_bg = fragment_length * number_of_fragments/genome_length
-
-    inputs:
-        - observations: cupy vector of observations at every point along the chromosome
-        - lambdas: cupy vector of the rates at every point along the chromosome.
-    outputs:
-        - p_values: cupy vector of p-values at every point along the chromosome
-    """
-    p_values = 1 - pdtr(observations, lambdas)
-    return p_values
 
 
 def compute_peaks(q_vals, thresh=0.1):
@@ -146,9 +110,159 @@ def calculate_peak_summits(peaks, signal):
     return min_values, arg_min_indices
 
 
+def extract_values(indexes, vec):
+    return vec[indexes]
+
+
+def fdr(unique_p_values, unique_p_counts):
+    """
+    Compute the FDR corrected values using the Benjamini-Hochberg procedure.
+
+    Parameters:
+    - unique_p_values (cp.ndarray): Vector of p-values (assumed unique).
+    - unique_p_counts (cp.ndarray): Vector of counts corresponding to the p-values.
+
+    Returns:
+    - pq_table (dict): Mapping of p-values to their q-values.
+    """
+    # Step 1: Sort unique p-values and counts
+    unique_p_values = -1 * unique_p_values  # Negate p-values for sorting
+    sorted_indices = cp.argsort(unique_p_values)[::-1]
+    sorted_unique_p_values = unique_p_values[sorted_indices]
+    sorted_counts = unique_p_counts[sorted_indices]
+    cumulative_k = cp.cumsum(sorted_counts) - sorted_counts + 1
+    sorted_unique_p_values = cp.where(
+        sorted_unique_p_values == -cp.inf, -cp.inf, sorted_unique_p_values
+    )
+    total_counts = cp.sum(unique_p_counts)
+
+    f = cp.log10(total_counts)
+    q_values = cp.asnumpy(sorted_unique_p_values + (cp.log10(cumulative_k) - f))
+
+    q_values_np = np.zeros(len(q_values))
+    preq_q = float("inf")
+    for i in range(len(q_values)):
+        q = max(min(preq_q, q_values[i]), 0)
+        preq_q = q
+        q_values_np[i] = q
+
+    p_values_original = -1 * sorted_unique_p_values  # Convert back to original p-values
+    pq_table = dict(zip(cp.asnumpy(p_values_original), q_values_np))
+
+    return pq_table
+
+
+def replace_with_dict(array, mapping):
+    """
+    Function to replace every element in the array with value in the dictionary. Utility function to replace p_values with q_values.
+    inputs:
+        - array: a cupy vector
+        - mapping: dictionary to replace the elements of the array
+    outputs:
+        - result: a vector whose values are replaced with the values from mapping.
+    """
+    keys = cp.array(list(mapping.keys()))
+    values = cp.array(list(mapping.values()))
+
+    sorted_indices = cp.argsort(keys)
+    sorted_keys = keys[sorted_indices]
+    sorted_values = values[sorted_indices]
+
+    idx = cp.searchsorted(sorted_keys, array)
+    valid = (idx < len(sorted_keys)) & (sorted_keys[idx] == array)
+
+    result = cp.where(valid, sorted_values[idx], array)
+
+    return result
+
+
+def make_pq_table(d, num_reads, d_treat=150, d_ctrl=10000, genome_length=3088286401):
+    """
+    This is a method to compute the pq-table. Across all chromosomes, we estimate significance values. Upon computing the frequencies of the
+    p-values, we compute calculate their ranks, and correct the p-values with Benjamini Hochberg correction procedure. The function returns a
+    dictionary of p-values as keys, and their correspoding q-values as it values. Since the alignment is done across all chromosomes, in one
+    go, we compute do this procedure first, to prevent biasing towards any one chromosome.
+
+    inputs:
+        - d : dictionary of coordinates of starts and ends for every chromosome.
+              d = {"chr1":{"start":[], "end":[]}, "chr2":{"start":[], "end":[]}}
+        - num_reads: number of reads
+        - d: distance for extending alignments to compute peaks
+        - d_ctrl: distance for extending alignments for building the null hypothesis
+        - genome_length: mappable genome length
+
+    outputs:
+        - pq_table: A dictionary of q-value for every p-value
+            {-14.533:-11:566, ...}
+        Note the p and q-values are log10 transformed.
+    """
+    unique_p_values = cp.asarray([])
+    unique_p_counts = cp.asarray([])
+    for c in d:
+        starts = np.array(d[c]["start"][0])
+        ends = np.array(d[c]["end"][0])
+
+        mempool = cp.get_default_memory_pool()
+        pinned_mempool = cp.get_default_pinned_memory_pool()
+
+        chrom_length = cp.max(ends)
+
+        scale = d_treat / d_ctrl
+        lambda_bg = 2 * d_treat * num_reads / genome_length
+
+        pileup_treat = pileup(starts, ends, chrom_length, int(d_treat / 2))
+        pileup_ctrl = pileup(starts, ends, chrom_length, int(d_ctrl / 2))
+        pileup_ctrl = cp.maximum(pileup_ctrl * scale, lambda_bg)
+        p_values = compute_poisson_cdfs(pileup_treat, pileup_ctrl)
+        p_values, p_counts = cp.unique(p_values, return_counts=True)
+        all_values = cp.concatenate((unique_p_values, p_values))
+        all_counts = cp.concatenate((unique_p_counts, p_counts))
+        merged_values, inverse_indices = cp.unique(all_values, return_inverse=True)
+        merged_counts = cp.zeros_like(merged_values, dtype=all_counts.dtype)
+        cp.add.at(merged_counts, inverse_indices, all_counts)
+
+        unique_p_values = merged_values
+        unique_p_counts = merged_counts
+
+        del (
+            pileup_ctrl,
+            pileup_treat,
+            p_values,
+            merged_values,
+            inverse_indices,
+            merged_counts,
+            all_values,
+            all_counts,
+        )
+
+        mempool.free_all_blocks()
+        pinned_mempool.free_all_blocks()
+        cp._default_memory_pool.free_all_blocks()
+    pq_table = fdr(unique_p_values, unique_p_counts)
+    return pq_table
+
+
+def compute_poisson_cdfs(observations, lambdas):
+    """
+    Function to compute the upper tail of a Poisson distribution. At every point along the chromsome we estimate
+    the expected number of reads based on a Poisson distribution. The expected number of reads is calculated as
+    max(scale*depth, lambda_bg).
+    lambda_bg = fragment_length * number_of_fragments/genome_length
+
+    inputs:
+        - observations: cupy vector of observations at every point along the chromosome
+        - lambdas: cupy vector of the rates at every point along the chromosome.
+    outputs:
+        - p_values: cupy vector of p-values at every point along the chromosome
+    """
+    p_vals = pdtrc(observations, lambdas)
+    return cp.log10(p_vals)
+
+
 def call_peaks(
     starts,
     ends,
+    pq_table,
     num_reads,
     q_thresh=0.1,
     d=150,
@@ -172,15 +286,15 @@ def call_peaks(
         - max_gap: gaps for extending peaks
         - peak_amp: Amplitude for filtering peaks.
     outputs:
-        - peaks_summit_q_vals: q-values of peak summits
-        - peak_summits_args: peak summits
-        - merged_peaks: Matrix of peak coordinates
+        - df_op: a dataframe with the peak information.
     """
+
     chrom_length = cp.max(ends)
 
-    # These constants explained in Zheng et al. (MACS3 paper)
     scale = d / d_ctrl
     lambda_bg = 2 * d * num_reads / genome_length
+    q_thresh = -cp.log10(q_thresh)
+    peak_amp = peak_amp - 1
 
     pileup_treat = pileup(starts, ends, chrom_length, int(d / 2))
     pileup_ctrl = pileup(starts, ends, chrom_length, int(d_ctrl / 2))
@@ -190,14 +304,23 @@ def call_peaks(
     p_values = compute_poisson_cdfs(pileup_treat, pileup_ctrl)
     print(dt.datetime.now(), "Computed P Values")
 
-    q_values = compute_q_values(p_values)
+    q_values = replace_with_dict(p_values, pq_table)
+
+    p_values[p_values == -cp.inf] = -1000
+    q_values[q_values == cp.inf] = 1000
     print(dt.datetime.now(), "Computed q Values")
 
-    peaks = compute_peaks(q_values, q_thresh)
+    peaks = compute_peaks(q_values, pileup_treat, pileup_ctrl, q_thresh)
     print(dt.datetime.now(), "Calculated Peaks")
+
+    if len(peaks) == 0:
+        return pd.DataFrame()
 
     m = merge_consecutive(peaks, max_gap)
     filtered_peaks = filter_peaks(m, peak_amp)
+    if len(filtered_peaks) == 0:
+        return pd.DataFrame()
+
     print(
         dt.datetime.now(),
         "Merged Peaks",
@@ -206,9 +329,27 @@ def call_peaks(
     )
 
     merged_peaks = cp.asnumpy(filtered_peaks)
-    peaks_summit_q_vals, peak_summits_args = calculate_peak_summits(
-        merged_peaks, cp.asnumpy(q_values)
+    peak_summits_args = calculate_peak_summits(merged_peaks, cp.asnumpy(p_values))
+    q_summit = cp.asnumpy(extract_values(peak_summits_args, q_values))
+    p_summit = cp.asnumpy(extract_values(peak_summits_args, p_values))
+    treat_summit = cp.asnumpy(extract_values(peak_summits_args, pileup_treat))
+    ctrl_summit = cp.asnumpy(extract_values(peak_summits_args, pileup_ctrl))
+
+    df_op = pd.DataFrame(
+        data={
+            "start": merged_peaks[:, 0],
+            "end": merged_peaks[:, 1],
+            "peak": peak_summits_args - merged_peaks[:, 0],
+            "signal_value": (treat_summit + 1) / (ctrl_summit + 1),
+            "p_value": -1 * p_summit,
+            "q_value": q_summit,
+            "pileup": treat_summit,
+        }
     )
+    df_op["name"] = "."
+    df_op["score"] = np.minimum(np.array(df_op["q_value"] * 10, dtype=np.int64), 1000)
+    df_op["strand"] = "."
+
     print(dt.datetime.now(), "Calulcated peaks summits")
 
     del q_values, p_values, pileup_treat, m, peaks, pileup_ctrl, filtered_peaks
@@ -217,12 +358,92 @@ def call_peaks(
     pinned_mempool.free_all_blocks()
     cp._default_memory_pool.free_all_blocks()
 
-    return peaks_summit_q_vals, peak_summits_args, merged_peaks
+    return df_op
+
+
+def gmacs(
+    intervals_by_chrom,
+    num_reads,
+    q_thresh=0.1,
+    d_treat=150,
+    d_ctrl=10000,
+    genome_length=3088286401,
+    max_gap=30,
+    peak_amp=150,
+):
+    """Function to run gmacs. It takes as input the a dictionary of read alignment coordinates, and computes the pq table and calls peaks.
+    inputs:
+        - intervals_by_chrom: dictionary of read alignment coordinates
+        - num_reads: number of reads
+        - q_thresh: hreshold for q-values to identify peaks
+        - d_treat: distance for extending alignments to compute peaks
+        - d_ctrl: distance for extending alignments for building the null hypothesis
+        - genome_length: Length of the mappable genome
+        - max_gap: gaps for extending peaks. Default [30]
+        - peak_amp: Amplitude for filtering peaks. Default [150]
+    outputs:
+        - peaks: A dataframe of peaks
+
+    """
+    start = dt.datetime.now()
+    pq_table = make_pq_table(
+        intervals_by_chrom,
+        num_reads,
+        genome_length=genome_length,
+        d_treat=d_treat,
+        d_ctrl=d_ctrl,
+    )
+    end = dt.datetime.now()
+    print(
+        f"Calculated PQ Table....., {(end - start).total_seconds() / 60.0}, minutes..."
+    )
+
+    wf_start = dt.datetime.now()
+    peaks = pd.DataFrame()
+
+    for chrom in intervals_by_chrom:
+        start = dt.datetime.now()
+        starts = np.array(intervals_by_chrom[chrom]["start"][0])
+        ends = np.array(intervals_by_chrom[chrom]["end"][0])
+        print(start, chrom)
+        df_chr = call_peaks(
+            starts,
+            ends,
+            pq_table,
+            num_reads,
+            max_gap=max_gap,
+            q_thresh=q_thresh,
+            peak_amp=peak_amp,
+            genome_length=genome_length,
+            d=d_treat,
+            d_ctrl=d_ctrl,
+        )
+        df_chr["chrom"] = chrom
+        peaks = pd.concat([peaks, df_chr], axis=0)
+        end = dt.datetime.now()
+        print(end, (end - start).total_seconds(), "Done\n")
+    peaks = peaks[
+        [
+            "chrom",
+            "start",
+            "end",
+            "name",
+            "score",
+            "strand",
+            "signal_value",
+            "p_value",
+            "q_value",
+            "peak",
+        ]
+    ]
+    wf_end = dt.datetime.now()
+    print(
+        f"Total time elapsed..., {(wf_end - wf_start).total_seconds() / 60.0}, minutes"
+    )
+
+    return peaks
 
 
 if __name__ == "__main__":
     intervals_by_chrom, num_reads = load_bedfile(Path("../MACS-3/Test_Data_2/1_.zst"))
-    for chrom in intervals_by_chrom:
-        starts = np.array(intervals_by_chrom[chrom]["start"])
-        ends = np.array(intervals_by_chrom[chrom]["end"])
-        call_peaks(starts, ends, num_reads)
+    df_op = gmacs(intervals_by_chrom=intervals_by_chrom, num_reads=num_reads)
