@@ -9,7 +9,7 @@ description = "GPU-accelerated MACS3"
 requires-python = ">=3.9"
 dependencies = [
     "zstandard",
-    "cupy",
+    "cupy-cuda12x",
     "numpy==1.26.4",
     "natsort==8.4.0",
     "pandas==2.1.1",
