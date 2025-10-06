@@ -1,7 +1,7 @@
 import datetime as dt
 from collections import defaultdict
 from pathlib import Path
-
+from line_profiler import profile
 import cupy as cp
 import numpy as np
 import pandas as pd
@@ -25,11 +25,11 @@ def pileup(starts, ends, chr_length, offset):
     outputs:
         - q_values: cupy vector of q-values at every point along the chromosome
     """
-    start_poss = np.concatenate((starts - offset, ends - offset))
-    end_poss = np.concatenate((starts + offset, ends + offset))
+    start_poss = cp.concatenate((starts - offset, ends - offset))
+    end_poss = cp.concatenate((starts + offset, ends + offset))
     cov_vec = cp.zeros(chr_length, dtype=np.int32)
-    start_poss = np.clip(start_poss, 0, chr_length - 1)
-    end_poss = np.clip(end_poss, 0, chr_length - 1)
+    start_poss = cp.clip(start_poss, 0, chr_length - 1)
+    end_poss = cp.clip(end_poss, 0, chr_length - 1)
     cp.add.at(cov_vec, start_poss, 1)
     cp.add.at(cov_vec, end_poss, -1)
     cov_vec = cp.cumsum(cov_vec)
@@ -172,8 +172,8 @@ def replace_with_dict(array, mapping):
 
     return result
 
-
-def make_pq_table(d, num_reads, d_treat=150, d_ctrl=10000, genome_length=3088286401):
+@profile
+def make_pq_table(result_df, num_reads, d_treat=150, d_ctrl=10000, genome_length=3088286401):
     """
     This is a method to compute the pq-table. Across all chromosomes, we estimate significance values. Upon computing the frequencies of the
     p-values, we compute calculate their ranks, and correct the p-values with Benjamini Hochberg correction procedure. The function returns a
@@ -181,10 +181,9 @@ def make_pq_table(d, num_reads, d_treat=150, d_ctrl=10000, genome_length=3088286
     go, we compute do this procedure first, to prevent biasing towards any one chromosome.
 
     inputs:
-        - d : dictionary of coordinates of starts and ends for every chromosome.
-              d = {"chr1":{"start":[], "end":[]}, "chr2":{"start":[], "end":[]}}
+        - result_df : Sorted cuDF DataFrame with 'chrom', 'start', 'end' columns
         - num_reads: number of reads
-        - d: distance for extending alignments to compute peaks
+        - d_treat: distance for extending alignments to compute peaks
         - d_ctrl: distance for extending alignments for building the null hypothesis
         - genome_length: mappable genome length
 
@@ -195,14 +194,21 @@ def make_pq_table(d, num_reads, d_treat=150, d_ctrl=10000, genome_length=3088286
     """
     unique_p_values = cp.asarray([])
     unique_p_counts = cp.asarray([])
-    for c in d:
-        starts = np.array(d[c]["start"][0])
-        ends = np.array(d[c]["end"][0])
+    
+    # Get unique chromosomes - must use .to_pandas() since chroms are strings (CuPy doesn't support strings)
+    chroms = result_df['chrom'].unique().to_pandas()
+    
+    for chrom in chroms:
+        # Filter for this chromosome - all operations stay on GPU
+        chrom_df = result_df[result_df['chrom'] == chrom]
+        # Extract columns as CuPy arrays directly - no CPU transfer for numeric data
+        starts = chrom_df['start'].to_cupy()
+        ends = chrom_df['end'].to_cupy()
 
         mempool = cp.get_default_memory_pool()
         pinned_mempool = cp.get_default_pinned_memory_pool()
 
-        chrom_length = cp.max(ends)
+        chrom_length = cp.max(ends).item()
 
         scale = d_treat / d_ctrl
         lambda_bg = 2 * d_treat * num_reads / genome_length
@@ -286,7 +292,7 @@ def call_peaks(
         - df_op: a dataframe with the peak information.
     """
 
-    chrom_length = cp.max(ends)
+    chrom_length = cp.max(ends).item()
 
     scale = d / d_ctrl
     lambda_bg = 2 * d * num_reads / genome_length
@@ -347,7 +353,7 @@ def call_peaks(
     df_op["score"] = np.minimum(np.array(df_op["q_value"] * 10, dtype=np.int64), 1000)
     df_op["strand"] = "."
 
-    print(dt.datetime.now(), "Calulcated peaks summits")
+    print(dt.datetime.now(), "Calculated peaks summits")
 
     del q_values, p_values, pileup_treat, m, peaks, pileup_ctrl, filtered_peaks
 
@@ -355,11 +361,12 @@ def call_peaks(
     pinned_mempool.free_all_blocks()
     cp._default_memory_pool.free_all_blocks()
 
+  
     return df_op
 
 
 def gmacs(
-    intervals_by_chrom,
+    result_df,
     num_reads,
     q_thresh=0.1,
     d_treat=150,
@@ -367,12 +374,13 @@ def gmacs(
     genome_length=3088286401,
     max_gap=30,
     peak_amp=150,
+    out='called_peaks'
 ):
-    """Function to run gmacs. It takes as input the a dictionary of read alignment coordinates, and computes the pq table and calls peaks.
+    """Function to run gmacs. It takes as input a DataFrame of read alignment coordinates, and computes the pq table and calls peaks.
     inputs:
-        - intervals_by_chrom: dictionary of read alignment coordinates
+        - result_df: Sorted cuDF DataFrame with 'chrom', 'start', 'end' columns
         - num_reads: number of reads
-        - q_thresh: hreshold for q-values to identify peaks
+        - q_thresh: threshold for q-values to identify peaks
         - d_treat: distance for extending alignments to compute peaks
         - d_ctrl: distance for extending alignments for building the null hypothesis
         - genome_length: Length of the mappable genome
@@ -384,7 +392,7 @@ def gmacs(
     """
     start = dt.datetime.now()
     pq_table = make_pq_table(
-        intervals_by_chrom,
+        result_df,
         num_reads,
         genome_length=genome_length,
         d_treat=d_treat,
@@ -398,10 +406,16 @@ def gmacs(
     wf_start = dt.datetime.now()
     peaks = pd.DataFrame()
 
-    for chrom in intervals_by_chrom:
+    # Get unique chromosomes - must use .to_pandas() since chroms are strings (CuPy doesn't support strings)
+    chroms = result_df['chrom'].unique().to_pandas()
+    
+    for chrom in chroms:
         start = dt.datetime.now()
-        starts = np.array(intervals_by_chrom[chrom]["start"][0])
-        ends = np.array(intervals_by_chrom[chrom]["end"][0])
+        # Filter for this chromosome - all operations stay on GPU
+        chrom_df = result_df[result_df['chrom'] == chrom]
+        # Extract columns as CuPy arrays directly - no CPU transfer for numeric data
+        starts = chrom_df['start'].to_cupy()
+        ends = chrom_df['end'].to_cupy()
         print(start, chrom)
         df_chr = call_peaks(
             starts,
@@ -433,17 +447,20 @@ def gmacs(
             "peak",
         ]
     ]
+    peaks['end']=peaks['end'].astype(int)
+    peaks['start']=peaks['start'].astype(int)
     wf_end = dt.datetime.now()
     print(
         f"Total time elapsed..., {(wf_end - wf_start).total_seconds() / 60.0}, minutes"
     )
-
-    return peaks
+    peaks.to_csv(f'{out}.tsv',index=False,sep='\t')
+    peaks.iloc[:,:3].to_csv(f'{out}.bed',index=False,sep='\t',header=False)
+    #return peaks
 
 
 if __name__ == "__main__":
-    intervals_by_chrom, num_reads = load_bedfile(
+    result_df, num_reads = load_bedfile(
         Path("../../MACS-3/Test_Data_2/1_.zst")
     )
-    df_op = gmacs(intervals_by_chrom=intervals_by_chrom, num_reads=num_reads)
+    df_op = gmacs(result_df=result_df, num_reads=num_reads)
     print(df_op.head())

@@ -1,0 +1,11 @@
+*.bed
+*.fai
+*.tsv
+*.gz
+.ipynb_checkpoints/
+
+*.pyc
+
+*egg-info
+uv.lock
+cufile.log

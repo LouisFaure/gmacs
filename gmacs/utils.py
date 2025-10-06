@@ -1,29 +1,20 @@
-from pathlib import Path
-
-import pandas as pd
-import polars as ps
-import zstandard as zstd
-
-dctx = zstd.ZstdDecompressor()
+import cudf
+import cupy as cp
+#import gzip
 
 
-def load_bedfile(zst_file):
-    with open(zst_file, "rb") as f:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(f) as reader:
-            df = ps.read_csv(
-                reader,
-                separator="\t",
-                new_columns=["chr", "start", "end", "strand", "qual"],
-            )
-    num_reads = len(df)
-    result_df = df.group_by("chr").agg(
-        [ps.col("start").implode(), ps.col("end").implode()]
+def load_bedfile(gz_file):
+    df = cudf.read_csv(
+        gz_file,
+        sep="\t",
+        names=['chrom', 'start', 'end', 'barcode', 'count'],
+        dtype={'chrom': 'str', 'start': 'int32', 'end': 'int32', 'barcode': 'str', 'count': 'int32'},
+        comment='#',
     )
-
-    # Convert to desired dictionary format
-    result = {
-        row["chr"]: {"start": row["start"], "end": row["end"]}
-        for row in result_df.to_dicts()
-    }
-    return result, num_reads
+    num_reads = len(df)
+    
+    # Instead of using collect (which creates list columns that require CPU transfer),
+    # store the sorted DataFrame and let gmacs extract per-chromosome data directly
+    result_df = df.sort_values(['chrom', 'start'])[['chrom', 'start', 'end']]
+    
+    return result_df, num_reads
