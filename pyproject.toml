@@ -11,7 +11,11 @@ dependencies = [
     "cudf-cu12",
     "numpy",
     "pandas",
+    "rapidgzip"
 ]
+
+[project.scripts]
+gmacs = "gmacs.cli:main"
 
 [tool.setuptools]
 packages = ["gmacs"]
