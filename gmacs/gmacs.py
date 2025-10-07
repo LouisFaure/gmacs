@@ -1,7 +1,7 @@
 import datetime as dt
 from collections import defaultdict
 from pathlib import Path
-from line_profiler import profile
+
 import cupy as cp
 import numpy as np
 import pandas as pd
@@ -172,7 +172,6 @@ def replace_with_dict(array, mapping):
 
     return result
 
-@profile
 def make_pq_table(result_df, num_reads, d_treat=150, d_ctrl=10000, genome_length=3088286401):
     """
     This is a method to compute the pq-table. Across all chromosomes, we estimate significance values. Upon computing the frequencies of the
